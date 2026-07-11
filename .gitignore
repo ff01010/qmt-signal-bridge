@@ -216,6 +216,7 @@ __marimo__/
 
 # QMT signal bridge local runtime files
 .env.bigqmt
+bt_big_qmt_gateway.log
 logs/
 
 # Streamlit
