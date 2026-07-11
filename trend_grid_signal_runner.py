@@ -27,8 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 HELPER_URL = "http://127.0.0.1:9000"
-DATA_CENTER_URL = "http://192.168.251.1:18000"
-DATA_CENTER_WS_URL = "ws://192.168.251.1:18000/ws/quote"
+DATA_CENTER_URL = "http://60.190.249.91:18000"
+DATA_CENTER_WS_URL = "ws://60.190.249.91:18000/ws/quote"
 ENV_FILE = ".env.bigqmt"
 STATE_FILE = "logs/trend_grid_signal_state.json"
 
