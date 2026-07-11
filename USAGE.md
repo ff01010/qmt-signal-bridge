@@ -10,11 +10,16 @@
 
 外部 runner 不直接下单，只发送交易意图。实际下单由运行在大 QMT 内部的 helper 完成。
 
+行情数据只依赖数据服务器。Big QMT helper 只负责交易账户、持仓、订单和下单接口，不负责行情 close 校准。
+
+runner 会把服务器 tick 在本地聚合成 OHLC bar。当前趋势网格信号仍按 bar close 判断，open/high/low 会保留给后续策略扩展使用。
+
 ## 运行前检查
 
 确认目录中有这些文件：
 
 ```text
+qmt_loader.py
 big_qmt_gateway_strategy_sample.py
 trend_grid_signal_runner.py
 .env.bigqmt.example
@@ -28,27 +33,34 @@ USAGE.md
 
 ```text
 BIG_QMT_GATEWAY_URL=http://127.0.0.1:9000
+BIG_QMT_GATEWAY_PORT=9000
 BIG_QMT_GATEWAY_PASSWORD=123456
+BIG_QMT_GATEWAY_SECRET=change_me_hmac_secret
+QMT_ACCOUNT_ID=70051230
+QMT_ACCOUNT_TYPE=stock
 ```
 
-确认 `big_qmt_gateway_strategy_sample.py` 中的配置与 `.env.bigqmt` 一致：
+helper 会读取 `.env.bigqmt` 中的端口、密码和账户配置：
 
-```python
-LISTEN_PORT = 9000
-GATEWAY_PASSWORD = "123456"
-ACCOUNT_ID = "18886101811"
-ACCOUNT_TYPE = "credit"
-RUN_HTTP_IN_BACKGROUND_THREAD = False
-STOP_HTTP_ON_QMT_STOP = False
+```text
+BIG_QMT_GATEWAY_PORT=9000
+BIG_QMT_GATEWAY_PASSWORD=123456
+QMT_ACCOUNT_ID=70051230
+QMT_ACCOUNT_TYPE=stock
 ```
+
+helper 会优先读取系统环境变量，其次读取同目录或当前工作目录下的 `.env.bigqmt`。推荐使用 `qmt_loader.py` 加载项目目录里的 helper，这样 helper 的文件路径会指向项目目录，可以直接读取项目目录中的 `.env.bigqmt`。
 
 ## 第一步：启动 Big QMT helper
 
-在大 QMT 中创建或打开专用策略，把 `big_qmt_gateway_strategy_sample.py` 的内容放进去运行。
+在大 QMT 中创建或打开专用策略，把 `qmt_loader.py` 的内容放进去运行。
+
+loader 的作用是读取并执行项目目录里的 `big_qmt_gateway_strategy_sample.py`。后续修改 helper 时，只需要修改项目文件并重启 QMT 策略，不需要再整段复制 helper。
 
 启动成功时，日志应出现：
 
 ```text
+[QMT_LOADER] loaded helper from C:\Users\zhongying\qmt_signal_bridge\big_qmt_gateway_strategy_sample.py
 listen success listen=127.0.0.1:9000
 entering tornado ioloop; gateway should keep running
 ```
@@ -89,7 +101,13 @@ dry-run 会计算信号，但不会真实下单。
 
 ```text
 [LOOP] security=688536.XSHG period=1m data_source=datacenter-ws interval=60.0s dry_run=True
-[WS] connected ws://192.168.100.4:18000/ws/quote?symbols=688536.SH
+[WS] connected ws://60.190.249.91:18000/ws/quote?symbols=688536.SH
+```
+
+新 bar 日志会显示本地聚合后的 OHLC：
+
+```text
+[BAR] 20260710133400 O=323.500 H=324.810 L=323.200 C=324.810 dry_run=True
 ```
 
 如果当前 bar 已经处理过，不会重复打印 `[BAR]`。

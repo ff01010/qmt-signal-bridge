@@ -20,6 +20,7 @@ import time
 import traceback
 import builtins
 import hashlib
+import urllib.parse
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -31,13 +32,64 @@ import tornado.web
 # Operator Configuration
 # =========================
 
+
+def _read_local_env_file() -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    candidates = []
+    script_file = globals().get("__file__", "")
+    if script_file:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(script_file)), ".env.bigqmt"))
+    candidates.append(os.path.join(os.getcwd(), ".env.bigqmt"))
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    result[key.strip()] = value.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return result
+
+
+_LOCAL_ENV = _read_local_env_file()
+
+
+def _config_value(name: str) -> str:
+    return os.environ.get(name) or _LOCAL_ENV.get(name) or ""
+
+
+def _config_int(name: str, default: int) -> int:
+    value = _config_value(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _gateway_url_port(default: int) -> int:
+    value = _config_value("BIG_QMT_GATEWAY_URL")
+    if not value:
+        return default
+    try:
+        parsed = urllib.parse.urlparse(value)
+        return int(parsed.port or default)
+    except Exception:
+        return default
+
 # Local bind host for the HTTP gateway. Keep 127.0.0.1 unless another machine
 # must connect directly to this QMT process.
 LISTEN_HOST = "127.0.0.1"
 
 # Local bind port for the HTTP gateway. The BulletTrade side must use the same
 # port in BIG_QMT_GATEWAY_URL or related configuration.
-LISTEN_PORT = 9000
+LISTEN_PORT = _config_int("BIG_QMT_GATEWAY_PORT", _gateway_url_port(9000))
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
@@ -46,19 +98,19 @@ GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
 # Authorization: Bearer <password>.
-GATEWAY_PASSWORD = "123456"
+GATEWAY_PASSWORD = _config_value("BIG_QMT_GATEWAY_PASSWORD")
 
 # Optional extra secret header for stronger local auth. If this no longer starts
 # with change_me, clients must send the same X-BulletTrade-Secret value.
-GATEWAY_SECRET = "change_me_hmac_secret"
+GATEWAY_SECRET = _config_value("BIG_QMT_GATEWAY_SECRET")
 
 # QMT fund account id. Requests may override it with account_id, but setting it
 # here is the normal gateway mode. Keep placeholder in shared examples.
-ACCOUNT_ID = "18886101811"
+ACCOUNT_ID = _config_value("QMT_ACCOUNT_ID")
 
 # QMT account type used by get_trade_detail_data/passorder. Stock accounts use
 # stock; other account types must match the broker/QMT environment.
-ACCOUNT_TYPE = "credit"
+ACCOUNT_TYPE = _config_value("QMT_ACCOUNT_TYPE")
 
 # Security used when callers ask for trade days without passing a symbol.
 # MiniQMT accepts symbol-less trade-day calls; Big QMT needs a concrete symbol,

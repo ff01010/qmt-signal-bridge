@@ -27,8 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 HELPER_URL = "http://127.0.0.1:9000"
-DATA_CENTER_URL = "http://192.168.100.4:18000"
-DATA_CENTER_WS_URL = "ws://192.168.100.4:18000/ws/quote"
+DATA_CENTER_URL = "http://60.190.249.91:18000"
+DATA_CENTER_WS_URL = "ws://60.190.249.91:18000/ws/quote"
 ENV_FILE = ".env.bigqmt"
 STATE_FILE = "logs/trend_grid_signal_state.json"
 
@@ -46,6 +46,9 @@ SELL_PRICE_TYPE = 7
 @dataclass
 class Bar:
   key: str
+  open: float
+  high: float
+  low: float
   close: float
 
 
@@ -109,19 +112,6 @@ class HelperClient:
     with urllib.request.urlopen(request, timeout=self.timeout) as response:
       return json.loads(response.read().decode("utf-8"))
 
-  def history(self, security: str, period: str, count: int) -> List[Bar]:
-    response = self.post(
-      "/data/history",
-      {
-        "security": security,
-        "frequency": period,
-        "fields": ["close"],
-        "count": count,
-      },
-    )
-    value = _require_ok(response, "history")
-    return _bars_from_history_payload(value)
-
   def positions(self) -> List[Dict[str, Any]]:
     response = self.post("/positions", {})
     return list(_require_ok(response, "positions").get("positions") or [])
@@ -140,6 +130,9 @@ class BarAggregator:
     self.period_seconds = _period_seconds(period)
     self.emit_open_bar = emit_open_bar
     self.current_bucket: str = ""
+    self.current_open = 0.0
+    self.current_high = 0.0
+    self.current_low = 0.0
     self.current_close = 0.0
 
   def accept(self, tick: Tick) -> List[Bar]:
@@ -147,21 +140,40 @@ class BarAggregator:
     if not bucket:
       return []
     if not self.current_bucket:
-      self.current_bucket = bucket
-      self.current_close = tick.price
+      self._start_bucket(bucket, tick.price)
       return []
     if bucket == self.current_bucket:
-      self.current_close = tick.price
+      self._update_bucket(tick.price)
       return []
-    bar = Bar(key=self.current_bucket, close=self.current_close)
-    self.current_bucket = bucket
-    self.current_close = tick.price
+    bar = self._current_bar()
+    self._start_bucket(bucket, tick.price)
     return [bar]
 
   def latest_open_bar(self) -> Optional[Bar]:
     if self.emit_open_bar and self.current_bucket:
-      return Bar(key=self.current_bucket, close=self.current_close)
+      return self._current_bar()
     return None
+
+  def _start_bucket(self, bucket: str, price: float) -> None:
+    self.current_bucket = bucket
+    self.current_open = price
+    self.current_high = price
+    self.current_low = price
+    self.current_close = price
+
+  def _update_bucket(self, price: float) -> None:
+    self.current_high = max(self.current_high, price)
+    self.current_low = min(self.current_low, price)
+    self.current_close = price
+
+  def _current_bar(self) -> Bar:
+    return Bar(
+      key=self.current_bucket,
+      open=self.current_open,
+      high=self.current_high,
+      low=self.current_low,
+      close=self.current_close,
+    )
 
 
 class SimpleWebSocket:
@@ -191,7 +203,7 @@ class SimpleWebSocket:
   def recv_json(self) -> Dict[str, Any]:
     while True:
       opcode, payload = self._recv_frame()
-      if opcode == 1:
+      if opcode in (1, 2):
         return json.loads(payload.decode("utf-8"))
       if opcode == 8:
         raise RuntimeError("websocket closed by server")
@@ -307,8 +319,11 @@ class DataCenterWebSocketSource:
     self.fallback = fallback
     self.socket: Optional[SimpleWebSocket] = None
     self.aggregator = BarAggregator(period, emit_open_bar=emit_open_bar)
+    self._bar_queue: List[Bar] = []
 
   def next_bar(self) -> Optional[Bar]:
+    if self._bar_queue:
+      return self._bar_queue.pop(0)
     try:
       self._ensure_connected()
       assert self.socket is not None
@@ -317,8 +332,10 @@ class DataCenterWebSocketSource:
         bars: List[Bar] = []
         for tick in _ticks_from_datacenter_payload(payload, self.symbol):
           bars.extend(self.aggregator.accept(tick))
+        if len(bars) > 1:
+          self._bar_queue.extend(bars[1:])
         if bars:
-          return bars[-1]
+          return bars[0]
         open_bar = self.aggregator.latest_open_bar()
         if open_bar is not None:
           return open_bar
@@ -340,19 +357,6 @@ class DataCenterWebSocketSource:
     if self.socket is not None:
       self.socket.close()
       self.socket = None
-
-
-class QmtHistorySource:
-  def __init__(self, helper: HelperClient, security: str, period: str, count: int, use_last_bar: bool) -> None:
-    self.helper = helper
-    self.security = security
-    self.period = period
-    self.count = count
-    self.use_last_bar = use_last_bar
-
-  def next_bar(self) -> Optional[Bar]:
-    bars = self.helper.history(self.security, self.period, self.count)
-    return _selected_closed_bar(bars, self.use_last_bar)
 
 
 def _require_ok(response: Dict[str, Any], action: str) -> Dict[str, Any]:
@@ -504,22 +508,6 @@ def _save_state(path: Path, state: StrategyState) -> None:
   path.write_text(json.dumps(asdict(state), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _bars_from_history_payload(payload: Dict[str, Any]) -> List[Bar]:
-  columns = list(payload.get("columns") or [])
-  records = list(payload.get("records") or [])
-  indexes = list(payload.get("index") or payload.get("indexes") or [])
-  if "close" not in columns:
-    return []
-  close_index = columns.index("close")
-  bars: List[Bar] = []
-  for idx, record in enumerate(records):
-    if close_index >= len(record):
-      continue
-    key = str(indexes[idx]) if idx < len(indexes) else str(idx)
-    bars.append(Bar(key=key, close=float(record[close_index] or 0)))
-  return bars
-
-
 def _trade_date_from_bar_key(key: str) -> str:
   digits = "".join(ch for ch in str(key) if ch.isdigit())
   return digits[:8] if len(digits) >= 8 else ""
@@ -663,14 +651,6 @@ def _handle_valley_signal(
   _send_signal(client, state, "open_long", security, "BUY", B_BASE_QTY, BUY_PRICE_TYPE, dry_run)
 
 
-def _selected_closed_bar(bars: List[Bar], use_last_bar: bool) -> Optional[Bar]:
-  if not bars:
-    return None
-  if use_last_bar or len(bars) == 1:
-    return bars[-1]
-  return bars[-2]
-
-
 def _load_runtime_env(args: argparse.Namespace) -> Dict[str, str]:
   env = _load_env(Path(args.env_file))
   args._runtime_env = env
@@ -693,9 +673,7 @@ def _build_helper(args: argparse.Namespace) -> HelperClient:
   return HelperClient(helper_url, password, timeout=args.timeout)
 
 
-def _build_bar_source(args: argparse.Namespace, helper: HelperClient) -> Any:
-  if args.data_source == "qmt-history":
-    return QmtHistorySource(helper, args.security, args.period, args.count, args.use_last_bar)
+def _build_bar_source(args: argparse.Namespace) -> Any:
   symbol = _to_datacenter_symbol(args.security)
   http_source = DataCenterHttpSource(
     args.data_center_url,
@@ -726,7 +704,10 @@ def _handle_bar(client: HelperClient, state: StrategyState, args: argparse.Names
     return False
   if state.last_processed_bar == bar.key:
     return False
-  print("[BAR] %s close=%.3f dry_run=%s" % (bar.key, bar.close, args.dry_run))
+  print(
+    "[BAR] %s O=%.3f H=%.3f L=%.3f C=%.3f dry_run=%s"
+    % (bar.key, bar.open, bar.high, bar.low, bar.close, args.dry_run)
+  )
   _process_bar(client, state, args.security, bar, args.dry_run)
   _save_state(Path(args.state_file), state)
   return True
@@ -734,7 +715,7 @@ def _handle_bar(client: HelperClient, state: StrategyState, args: argparse.Names
 
 def run_once(args: argparse.Namespace) -> None:
   client = _build_helper(args)
-  source = _build_bar_source(args, client)
+  source = _build_bar_source(args)
   state = _load_state(Path(args.state_file))
   _handle_bar(client, state, args, source.next_bar())
 
@@ -745,7 +726,7 @@ def run_loop(args: argparse.Namespace) -> None:
     % (args.security, args.period, args.data_source, args.interval, args.dry_run)
   )
   client = _build_helper(args)
-  source = _build_bar_source(args, client)
+  source = _build_bar_source(args)
   state = _load_state(Path(args.state_file))
   while True:
     started = time.time()
@@ -771,7 +752,7 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--helper-url", default=None, help="Big QMT helper URL. Defaults to BIG_QMT_GATEWAY_URL or 127.0.0.1:9000.")
   parser.add_argument(
     "--data-source",
-    choices=["qmt-history", "datacenter-ws", "datacenter-http"],
+    choices=["datacenter-ws", "datacenter-http"],
     default="datacenter-ws",
     help="Market data source. Defaults to datacenter WebSocket; HTTP fallback stays enabled unless --no-http-fallback is set.",
   )
